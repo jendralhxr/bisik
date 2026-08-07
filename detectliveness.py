@@ -9,6 +9,13 @@ import librosa
 import numpy as np
 
 
+def load_wav(
+    file_path: str, target_sr: int = 22050, mono: bool = True
+) -> tuple[np.ndarray, int]:
+    """Loads a WAV file and returns the audio array and sample rate."""
+    y, sr = librosa.load(file_path, sr=target_sr, mono=mono)
+    return y, sr
+
 class AcousticLivenessScorer:
     """Extracts 6 acoustic liveness metrics, normalizes them into individual spoofing risk
 
@@ -201,26 +208,18 @@ class AcousticLivenessScorer:
 
 # --- Example Usage ---
 if __name__ == '__main__':
-    # Generate 3 seconds of dummy audio (e.g., sine + noise)
-    sr = 22050
-    t = np.linspace(0, 3, sr * 3)
-    dummy_audio = np.sin(2 * np.pi * 440 * t) + 0.1 * np.random.randn(len(t))
+    y, sr = load_wav('test_sample.wav')
 
-    # Initialize scorer with optional custom weights
-    custom_weights = {
-        'crest_factor': 0.25,
-        'spectral_rolloff_tilt': 0.15,
-        'bispectrum_distortion': 0.10,
-        'harmonic_dynamics': 0.15,
-        'temporal_dynamic_range': 0.25,
-        'peak_clipping': 0.10,
-    }
-
-    scorer = AcousticLivenessScorer(weights=custom_weights, sample_rate=sr)
-    result = scorer.predict_liveness(dummy_audio)
+    #scorer = AcousticLivenessScorer(weights=custom_weights, sample_rate=sr)
+    scorer = AcousticLivenessScorer(sample_rate=sr)
+    result = scorer.predict_liveness(y)
+    print(result)
 
     print(f"Overall Spoof Likelihood: {result['spoof_likelihood'] * 100:.2f}%")
     print(f"Decision: {result['decision']}")
     print('\nIndividual Sub-Scores (0 = Live, 1 = Spoof):')
     for k, v in result['subscores'].items():
         print(f"  - {k}: {v}")
+        
+        
+        
