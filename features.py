@@ -1,7 +1,6 @@
 import librosa
 import numpy as np
 
-
 # AMPLITUDE
 
 # Dynamic Range Compression: Crest Factor (PAPR), berhaps on the sub-vocal pop/breath vibrations (<80 Hz)
