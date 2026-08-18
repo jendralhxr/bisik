@@ -100,5 +100,4 @@ scorer = AcousticLivenessScorer(weights=custom_weights, sample_rate=sr)
 - Designed for research, prototyping, and experimentation rather than production-grade anti-spoofing.
 
 ## License
-
-No license file is currently included in this repository. Contact the repository owner ([@jendralhxr](https://github.com/jendralhxr)) regarding usage terms.
+This codebase follows The MIT License (https://opensource.org/license/mit).
