@@ -224,15 +224,14 @@ class AcousticLivenessScorer:
         return subscores
 
     # --- Main Analysis Function ---
-    def predict_liveness(self, y: np.ndarray) -> dict:
-        """Extracts all features, computes individual sub-scores, and aggregates the overall spoofing likelihood metric."""
-        # 1. Raw Feature Extraction
+    def extract_raw_features(self, y: np.ndarray) -> dict:
+        """Unrounded raw acoustic metrics (also the input for supervised models)."""
         rolloff, tilt = self._get_spectral_rolloff_tilt(y)
         dr_mean, dr_std = self._get_temporal_dynamic_range(y)
         clip_ratio, max_run = self._get_peak_clipping(y)
         echo_amp, echo_delay = self._get_echo(y)
 
-        raw_features = {
+        return {
             'crest_factor': self._get_crest_factor(y),
             'spectral_rolloff': rolloff,
             'tilt': tilt,
@@ -245,6 +244,11 @@ class AcousticLivenessScorer:
             'echo_amplitude': echo_amp,
             'echo_delay_ms': echo_delay,
         }
+
+    def predict_liveness(self, y: np.ndarray) -> dict:
+        """Extracts all features, computes individual sub-scores, and aggregates the overall spoofing likelihood metric."""
+        # 1. Raw Feature Extraction
+        raw_features = self.extract_raw_features(y)
 
         # 2. Convert to normalized sub-scores [0.0 - 1.0]
         subscores = self._normalize_to_subscores(raw_features)
