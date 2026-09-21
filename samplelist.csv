@@ -1,0 +1,17 @@
+file,label,group
+audio/live/spk01_utt01.wav,live speech,spk01
+audio/live/spk01_utt02.wav,live speech,spk01
+audio/replay/spk01_utt01_phoneA_room1.wav,replay spoof,spk01
+audio/replay/spk01_utt02_laptop_room2.wav,replay spoof,spk01
+audio/live/spk02_utt01.wav,live speech,spk02
+audio/live/spk02_utt02.wav,live speech,spk02
+audio/replay/spk02_utt01_phoneA_room1.wav,replay spoof,spk02
+audio/replay/spk02_utt02_speakerB_room3.wav,replay spoof,spk02
+audio/live/spk03_utt01.wav,live speech,spk03
+audio/live/spk03_utt02.wav,live speech,spk03
+audio/replay/spk03_utt01_laptop_room2.wav,replay spoof,spk03
+audio/replay/spk03_utt02_speakerB_room3.wav,replay spoof,spk03
+audio/live/spk04_utt01.wav,live speech,spk04
+audio/live/spk04_utt02.wav,live speech,spk04
+audio/replay/spk04_utt01_phoneA_room1.wav,replay spoof,spk04
+audio/replay/spk04_utt02_laptop_room2.wav,replay spoof,spk04

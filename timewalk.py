@@ -67,6 +67,7 @@ def liveness_timeline(
     hop_s: float = HOP_S,
     dr_std_context_s: float = 2.0,
     scorer: AcousticLivenessScorer = None,
+    verbose: bool = True,
 ) -> dict:
     """Return per-window raw features, sub-scores and overall spoof score.
 
@@ -96,7 +97,7 @@ def liveness_timeline(
         raw['temp_dr_mean'][i] = _window_dynamic_range(seg)
         raw['clip_ratio'][i], raw['max_flat_run'][i] = _window_peak_clipping(seg, ref_peak)
         raw['echo_amplitude'][i], raw['echo_delay_ms'][i] = scorer._get_echo(seg)
-        if (i + 1) % max(1, len(starts) // 10) == 0:
+        if verbose and (i + 1) % max(1, len(starts) // 10) == 0:
             print(f'  {i + 1}/{len(starts)} windows  ({time.time() - t0:.0f}s)')
 
     half = max(1, int(round(dr_std_context_s / hop_s)) // 2)
