@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sliding-window timeline of the six acoustic liveness indices.
+Sliding-window timeline of the seven acoustic liveness indices.
 
 Each 0.5 s window (advanced by 30 ms) is scored as if it were an independent
 clip, using the methods of AcousticLivenessScorer from detectliveness.py.
 Two figures are produced:
-  <out>_subscores.png : waveform + six normalized sub-scores + overall spoof score
+  <out>_subscores.png : waveform + seven normalized sub-scores + overall spoof score
   <out>_raw.png       : waveform + the raw physical metrics behind each sub-score
 
 Keep this file next to detectliveness.py.
@@ -82,7 +82,8 @@ def liveness_timeline(
     starts = np.arange(0, len(y) - win + 1, hop)
     ref_peak = float(np.max(np.abs(y)))
     keys = ['crest_factor', 'spectral_rolloff', 'tilt', 'bispectrum',
-            'harmonic_high_ratio', 'temp_dr_mean', 'clip_ratio', 'max_flat_run']
+            'harmonic_high_ratio', 'temp_dr_mean', 'clip_ratio', 'max_flat_run',
+            'echo_amplitude', 'echo_delay_ms']
     raw = {k: np.zeros(len(starts)) for k in keys}
 
     t0 = time.time()
@@ -94,6 +95,7 @@ def liveness_timeline(
         raw['harmonic_high_ratio'][i] = scorer._get_harmonic_band_ratio(seg)
         raw['temp_dr_mean'][i] = _window_dynamic_range(seg)
         raw['clip_ratio'][i], raw['max_flat_run'][i] = _window_peak_clipping(seg, ref_peak)
+        raw['echo_amplitude'][i], raw['echo_delay_ms'][i] = scorer._get_echo(seg)
         if (i + 1) % max(1, len(starts) // 10) == 0:
             print(f'  {i + 1}/{len(starts)} windows  ({time.time() - t0:.0f}s)')
 
@@ -130,7 +132,7 @@ def _waveform(ax, y, sr):
 def plot_subscores(res, y, sr, path):
     t, sub, w = res['t'], res['sub'], res['weights']
     names = list(sub)
-    fig, axes = plt.subplots(len(names) + 2, 1, figsize=(11, 13), sharex=True,
+    fig, axes = plt.subplots(len(names) + 2, 1, figsize=(11, 14), sharex=True,
                              gridspec_kw={'height_ratios': [1.2] + [1] * len(names) + [1.4]})
     _waveform(axes[0], y, sr)
     for ax, k in zip(axes[1:-1], names):
@@ -155,9 +157,11 @@ def plot_subscores(res, y, sr, path):
 
 
 def plot_raw(res, y, sr, path):
-    t, r = res['t'], res['raw']
-    fig, axes = plt.subplots(7, 1, figsize=(11, 13), sharex=True,
-                             gridspec_kw={'height_ratios': [1.2] + [1] * 6})
+    t, r = res['t'], dict(res['raw'])
+    # the delay is only meaningful where an echo is actually detected
+    r['echo_delay_ms'] = np.where(r['echo_amplitude'] > 0.12, r['echo_delay_ms'], np.nan)
+    fig, axes = plt.subplots(8, 1, figsize=(11, 14.5), sharex=True,
+                             gridspec_kw={'height_ratios': [1.2] + [1] * 7})
     _waveform(axes[0], y, sr)
 
     def twin(ax, k1, k2, l1, l2, c1='tab:blue', c2='tab:orange'):
@@ -180,7 +184,9 @@ def plot_raw(res, y, sr, path):
     axes[5].set_ylabel('temporal DR\n[dB]', fontsize=8)
     axes[5].legend(fontsize=7, loc='upper right')
     twin(axes[6], 'clip_ratio', 'max_flat_run', 'clip ratio', 'max flat run\n[samples]')
-    axes[6].set_xlabel('time [s]  (window centre)')
+    twin(axes[7], 'echo_amplitude', 'echo_delay_ms', 'echo amplitude\n(cepstral)', 'echo delay [ms]',
+         c2='tab:green')
+    axes[7].set_xlabel('time [s]  (window centre)')
     for ax in axes[1:]:
         ax.grid(alpha=0.3)
     axes[0].set_title('Raw acoustic metrics per window')

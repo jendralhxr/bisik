@@ -7,15 +7,6 @@ Created on Fri Aug  7 16:26:53 2026
 
 import librosa
 import numpy as np
-import matplotlib.pyplot as plt
-import argparse
-import csv
-import time
-
-WIN_S = 0.5    # window length [s]
-HOP_S = 0.030  # window increment [s]
-
-
 
 
 def load_wav(
@@ -26,7 +17,7 @@ def load_wav(
     return y, sr
 
 class AcousticLivenessScorer:
-    """Extracts 6 acoustic liveness metrics, normalizes them into individual spoofing risk
+    """Extracts 7 acoustic liveness metrics, normalizes them into individual spoofing risk
 
     sub-scores (0.0 to 1.0), and computes an overall weighted spoof likelihood.
     """
@@ -42,6 +33,7 @@ class AcousticLivenessScorer:
             'harmonic_dynamics': 0.15,  # High-frequency harmonic energy ratio
             'temporal_dynamic_range': 0.20,  # Temporal envelope variance (AGC/DRC)
             'peak_clipping': 0.15,  # Amplifier saturation / clipping
+            'echo_amplitude': 0.15,  # Second acoustic path (speaker -> room -> mic)
         }
         self._normalize_weights()
 
@@ -127,6 +119,55 @@ class AcousticLivenessScorer:
         )
         return clip_ratio, max_run
 
+    def _get_echo(
+        self,
+        y,
+        min_delay_ms=30.0,
+        max_delay_ms=150.0,
+        frame_s=0.5,
+        band=(100.0, 8000.0),
+    ):
+        """Cepstral echo detection -> (echo_amplitude, echo_delay_ms).
+
+        A delayed copy alpha*x(t - tau) adds alpha*cos(w*tau) to the log-magnitude
+        spectrum, i.e. a peak of height ~alpha/2 at quefrency tau in the real
+        cepstrum. Cepstra of 0.5 s Hann frames are averaged (a single frame if
+        the input is shorter), which suppresses pitch rahmonics that move from
+        frame to frame while a fixed-delay echo persists. The peak height is
+        divided by the window's own overlap at that lag, because a Hann window
+        attenuates a delayed copy of itself. Lags below `min_delay_ms` are
+        ignored so that pitch periods are not mistaken for echoes.
+        The result is a monotonic, compressed proxy of the echo gain, not a
+        calibrated alpha.
+        """
+        frame = min(int(frame_s * self.sr), len(y))
+        starts = (
+            [0] if len(y) <= frame else range(0, len(y) - frame + 1, frame // 2)
+        )
+        n_fft = int(2 ** np.ceil(np.log2(2 * frame)))
+        win = np.hanning(frame)
+        freqs = np.fft.rfftfreq(n_fft, 1.0 / self.sr)
+        mask = (freqs >= band[0]) & (freqs <= min(band[1], self.sr / 2))
+
+        cep = np.zeros(n_fft)
+        for s in starts:
+            mag = np.abs(np.fft.rfft(y[s : s + frame] * win, n=n_fft))
+            log_mag = np.zeros_like(mag)
+            log_mag[mask] = np.log(mag[mask] + 1e-10)
+            log_mag[mask] -= log_mag[mask].mean()
+            cep += np.fft.irfft(log_mag, n=n_fft)
+        cep /= len(starts)
+
+        lo = int(min_delay_ms * 1e-3 * self.sr)
+        hi = min(int(max_delay_ms * 1e-3 * self.sr), n_fft // 2 - 1)
+        if hi <= lo:
+            return 0.0, 0.0
+        overlap = np.fft.irfft(np.abs(np.fft.rfft(win, n=n_fft)) ** 2)
+        overlap = np.clip(overlap / overlap[0], 0.3, 1.0)
+        amp = 2.0 * cep[lo : hi + 1] / overlap[lo : hi + 1]
+        k = int(np.argmax(amp))
+        return float(max(amp[k], 0.0)), float(1000.0 * (lo + k) / self.sr)
+
     # --- Normalization (Acoustic Threshold Mapping to [0.0, 1.0]) ---
     def _normalize_to_subscores(self, raw_features: dict) -> dict:
         """Converts raw acoustic metrics into individual spoof likelihood sub-scores [0.0 = Live, 1.0 = Spoof]."""
@@ -174,6 +215,12 @@ class AcousticLivenessScorer:
             np.clip(clip_ratio * 50.0 + (max_run / 20.0), 0.0, 1.0)
         )
 
+        # 7. Echo Amplitude (cepstral): Live close-talk ~ < 0.08; replay through a
+        #    room adds a second path, typically > 0.3
+        subscores['echo_amplitude'] = float(
+            np.clip((raw_features['echo_amplitude'] - 0.08) / 0.25, 0.0, 1.0)
+        )
+
         return subscores
 
     # --- Main Analysis Function ---
@@ -183,6 +230,7 @@ class AcousticLivenessScorer:
         rolloff, tilt = self._get_spectral_rolloff_tilt(y)
         dr_mean, dr_std = self._get_temporal_dynamic_range(y)
         clip_ratio, max_run = self._get_peak_clipping(y)
+        echo_amp, echo_delay = self._get_echo(y)
 
         raw_features = {
             'crest_factor': self._get_crest_factor(y),
@@ -194,6 +242,8 @@ class AcousticLivenessScorer:
             'temp_dr_std': dr_std,
             'clip_ratio': clip_ratio,
             'max_flat_run': max_run,
+            'echo_amplitude': echo_amp,
+            'echo_delay_ms': echo_delay,
         }
 
         # 2. Convert to normalized sub-scores [0.0 - 1.0]
@@ -216,9 +266,8 @@ class AcousticLivenessScorer:
 
 
 # --- Example Usage ---
-""" ingest all at once
 if __name__ == '__main__':
-    y, sr = load_wav('test.wav')
+    y, sr = load_wav('test_sample.wav')
 
     #scorer = AcousticLivenessScorer(weights=custom_weights, sample_rate=sr)
     scorer = AcousticLivenessScorer(sample_rate=sr)
@@ -230,206 +279,6 @@ if __name__ == '__main__':
     print('\nIndividual Sub-Scores (0 = Live, 1 = Spoof):')
     for k, v in result['subscores'].items():
         print(f"  - {k}: {v}")
-"""
         
-# --------------------------------------------------------------------------
-# Per-window feature helpers
-# --------------------------------------------------------------------------
-def _window_dynamic_range(seg: np.ndarray) -> float:
-    """Same per-window DR as AcousticLivenessScorer._get_temporal_dynamic_range
-    (95th - 5th percentile of the short-time RMS in dB)."""
-    rms = librosa.feature.rms(y=seg, frame_length=512, hop_length=128)[0]
-    rms_db = librosa.amplitude_to_db(rms, ref=np.max)
-    return float(np.percentile(rms_db, 95) - np.percentile(rms_db, 5))
-
-
-def _window_peak_clipping(seg: np.ndarray, ref_peak: float):
-    """Same as AcousticLivenessScorer._get_peak_clipping, but normalised by the
-    peak of the WHOLE recording. Normalising by each window's own peak would
-    make every quiet window look clipped (its loudest sample is always 1.0)."""
-    norm = np.abs(seg) / (ref_peak + 1e-8)
-    clip_ratio = float(np.mean(norm >= 0.98))
-    flat = (np.abs(np.diff(seg)) < 1e-4) & (norm[:-1] >= 0.98)
-    if not flat.any():
-        return clip_ratio, 0.0
-    edges = np.where(np.diff(np.pad(flat.astype(int), (1, 1))))[0]
-    runs = edges[1::2] - edges[::2]
-    return clip_ratio, float(runs.max())
-
-
-def _rolling_std(x: np.ndarray, half_width: int) -> np.ndarray:
-    return np.array(
-        [np.std(x[max(0, i - half_width): i + half_width + 1]) for i in range(len(x))]
-    )
-
-
-# --------------------------------------------------------------------------
-# Main timeline computation
-# --------------------------------------------------------------------------
-def liveness_timeline(
-    y: np.ndarray,
-    sr: int,
-    win_s: float = WIN_S,
-    hop_s: float = HOP_S,
-    dr_std_context_s: float = 2.0,
-    scorer: AcousticLivenessScorer = None,
-) -> dict:
-    """Return per-window raw features, sub-scores and overall spoof score.
-
-    dr_std_context_s: a single 0.5 s window has no 'std of DR across windows',
-    so that term is taken as the rolling std of the per-window DR over a
-    centred context of this length.
-    """
-    scorer = scorer or AcousticLivenessScorer(sample_rate=sr)
-    win, hop = int(round(win_s * sr)), int(round(hop_s * sr))
-    if len(y) < win:
-        raise ValueError(f'Audio ({len(y) / sr:.2f} s) is shorter than one window ({win_s} s).')
-
-    starts = np.arange(0, len(y) - win + 1, hop)
-    ref_peak = float(np.max(np.abs(y)))
-    keys = ['crest_factor', 'spectral_rolloff', 'tilt', 'bispectrum',
-            'harmonic_high_ratio', 'temp_dr_mean', 'clip_ratio', 'max_flat_run']
-    raw = {k: np.zeros(len(starts)) for k in keys}
-
-    t0 = time.time()
-    for i, s in enumerate(starts):
-        seg = y[s: s + win]
-        raw['crest_factor'][i] = scorer._get_crest_factor(seg)
-        raw['spectral_rolloff'][i], raw['tilt'][i] = scorer._get_spectral_rolloff_tilt(seg)
-        raw['bispectrum'][i] = scorer._get_bispectrum_magnitude(seg)
-        raw['harmonic_high_ratio'][i] = scorer._get_harmonic_band_ratio(seg)
-        raw['temp_dr_mean'][i] = _window_dynamic_range(seg)
-        raw['clip_ratio'][i], raw['max_flat_run'][i] = _window_peak_clipping(seg, ref_peak)
-        if (i + 1) % max(1, len(starts) // 10) == 0:
-            print(f'  {i + 1}/{len(starts)} windows  ({time.time() - t0:.0f}s)')
-
-    half = max(1, int(round(dr_std_context_s / hop_s)) // 2)
-    raw['temp_dr_std'] = _rolling_std(raw['temp_dr_mean'], half)
-
-    # Reuse the scorer's own normalisation, window by window
-    sub_keys = list(scorer.weights)
-    sub = {k: np.zeros(len(starts)) for k in sub_keys}
-    for i in range(len(starts)):
-        sc = scorer._normalize_to_subscores({k: v[i] for k, v in raw.items()})
-        for k in sub_keys:
-            sub[k][i] = sc[k]
-    overall = sum(scorer.weights[k] * sub[k] for k in sub_keys)
-
-    return {
-        't': (starts + win / 2) / sr,  # window centres [s]
-        'raw': raw,
-        'sub': sub,
-        'overall': overall,
-        'weights': scorer.weights,
-    }
-
-
-# --------------------------------------------------------------------------
-# Plotting
-# --------------------------------------------------------------------------
-def _waveform(ax, y, sr):
-    ax.plot(np.arange(len(y)) / sr, y, lw=0.4, color='0.35')
-    ax.set_ylabel('waveform')
-    ax.set_ylim(-1.05 * np.max(np.abs(y)), 1.05 * np.max(np.abs(y)))
-
-
-def plot_subscores(res, y, sr, path):
-    t, sub, w = res['t'], res['sub'], res['weights']
-    names = list(sub)
-    fig, axes = plt.subplots(len(names) + 2, 1, figsize=(11, 13), sharex=True,
-                             gridspec_kw={'height_ratios': [1.2] + [1] * len(names) + [1.4]})
-    _waveform(axes[0], y, sr)
-    for ax, k in zip(axes[1:-1], names):
-        ax.plot(t, sub[k], lw=1.2, color='tab:blue')
-        ax.set_ylim(-0.05, 1.05)
-        ax.set_ylabel(f'{k}\n(w={w[k]:.2f})', fontsize=8)
-        ax.grid(alpha=0.3)
-    ax = axes[-1]
-    ax.plot(t, res['overall'], lw=1.5, color='k')
-    ax.axhline(0.5, color='tab:red', ls='--', lw=1)
-    ax.fill_between(t, 0.5, res['overall'], where=res['overall'] >= 0.5,
-                    color='tab:red', alpha=0.3, interpolate=True)
-    ax.set_ylim(-0.05, 1.05)
-    ax.set_ylabel('overall spoof\nlikelihood', fontsize=8)
-    ax.set_xlabel('time [s]  (window centre)')
-    ax.grid(alpha=0.3)
-    axes[0].set_title('Sub-scores per window (0 = live, 1 = spoof)')
-    axes[0].set_xlim(0, len(y) / sr)
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    return fig
-
-
-def plot_raw(res, y, sr, path):
-    t, r = res['t'], res['raw']
-    fig, axes = plt.subplots(7, 1, figsize=(11, 13), sharex=True,
-                             gridspec_kw={'height_ratios': [1.2] + [1] * 6})
-    _waveform(axes[0], y, sr)
-
-    def twin(ax, k1, k2, l1, l2, c1='tab:blue', c2='tab:orange'):
-        ax.plot(t, r[k1], color=c1, lw=1.2)
-        ax.set_ylabel(l1, color=c1, fontsize=8)
-        ax2 = ax.twinx()
-        ax2.plot(t, r[k2], color=c2, lw=1.0)
-        ax2.set_ylabel(l2, color=c2, fontsize=8)
-
-    ax = axes[1]
-    ax.plot(t, r['crest_factor'], lw=1.2)
-    ax.set_ylabel('crest factor\n[dB]', fontsize=8)
-    twin(axes[2], 'spectral_rolloff', 'tilt', 'roll-off 95%\n[Hz]', 'tilt [dB/decade]')
-    axes[3].plot(t, r['bispectrum'], lw=1.2)
-    axes[3].set_ylabel('bispectrum\nmagnitude', fontsize=8)
-    axes[4].plot(t, r['harmonic_high_ratio'], lw=1.2)
-    axes[4].set_ylabel('harmonic ratio\n3.4-8 kHz', fontsize=8)
-    axes[5].plot(t, r['temp_dr_mean'], lw=1.2, label='DR (p95-p5)')
-    axes[5].plot(t, r['temp_dr_std'], lw=1.0, color='tab:orange', label='rolling std')
-    axes[5].set_ylabel('temporal DR\n[dB]', fontsize=8)
-    axes[5].legend(fontsize=7, loc='upper right')
-    twin(axes[6], 'clip_ratio', 'max_flat_run', 'clip ratio', 'max flat run\n[samples]')
-    axes[6].set_xlabel('time [s]  (window centre)')
-    for ax in axes[1:]:
-        ax.grid(alpha=0.3)
-    axes[0].set_title('Raw acoustic metrics per window')
-    axes[0].set_xlim(0, len(y) / sr)
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    return fig
-
-
-def save_csv(res, path):
-    cols = {'time_s': res['t'], **{f'raw_{k}': v for k, v in res['raw'].items()},
-            **{f'sub_{k}': v for k, v in res['sub'].items()},
-            'overall_spoof_likelihood': res['overall']}
-    with open(path, 'w', newline='') as f:
-        wr = csv.writer(f)
-        wr.writerow(cols)
-        wr.writerows(zip(*cols.values()))
-
-
-# --------------------------------------------------------------------------
-if __name__ == '__main__':
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    ap.add_argument('wav', nargs='?', default='harmonika.wav')
-    ap.add_argument('--sr', type=int, default=22050)
-    ap.add_argument('--win', type=float, default=WIN_S, help='window length [s]')
-    ap.add_argument('--hop', type=float, default=HOP_S, help='window increment [s]')
-    ap.add_argument('--dr-context', type=float, default=2.0,
-                    help='context [s] for the rolling std of temporal DR')
-    ap.add_argument('--out', default=None, help='output prefix (default: wav name)')
-    ap.add_argument('--show', action='store_true', help='open the figures interactively')
-    args = ap.parse_args()
-
-    out = args.out or args.wav.rsplit('.', 1)[0] + '_timeline'
-    y, sr = load_wav(args.wav, target_sr=args.sr)
-    print(f'{len(y) / sr:.2f} s @ {sr} Hz  ->  window {args.win}s / hop {args.hop}s')
-
-    res = liveness_timeline(y, sr, args.win, args.hop, args.dr_context)
-    plot_subscores(res, y, sr, f'{out}_subscores.png')
-    plot_raw(res, y, sr, f'{out}_raw.png')
-    save_csv(res, f'{out}.csv')
-    print(f'Saved {out}_subscores.png, {out}_raw.png, {out}.csv')
-    print(f'Mean overall spoof likelihood: {res["overall"].mean():.3f}; '
-          f'{100 * np.mean(res["overall"] >= 0.5):.1f}% of windows >= 0.5')
-    if args.show:
-        plt.show()
+        
         
