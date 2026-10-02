@@ -210,7 +210,7 @@ def save_csv(res, path):
 # --------------------------------------------------------------------------
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    ap.add_argument('wav', nargs='?', default='test_sample.wav')
+    ap.add_argument('wav', nargs='?', default='atasnama-spoof.wav')
     ap.add_argument('--sr', type=int, default=22050)
     ap.add_argument('--win', type=float, default=WIN_S, help='window length [s]')
     ap.add_argument('--hop', type=float, default=HOP_S, help='window increment [s]')
