@@ -1,36 +1,36 @@
 import os
-import glob
 import numpy as np
 import pandas as pd
 import librosa
 
-# Define frequency band boundaries (in Hz)
-BANDS = {
-    "Low": (0, 1000),
-    "Mid": (1000, 4000),
-    "High": (4000, 8000),
-    "Super": (8000, 16000)
-}
+def get_bands(sr):
+    """Dynamically generates frequency bands based on input sample rate."""
+    nyquist = sr / 2.0
+    return {
+        "Infrasound": (0, 20),
+        "SubBass": (20, 50),
+        "PowerLine": (50, 120),
+        "CoreVocal": (120, 1000),
+        "Telephony_DTMF": (1000, 3500),
+        "AudiophileHigh": (3500, min(20000, nyquist)),
+        "Ultrasonic_Nyquist": (20000, nyquist) if nyquist > 20000 else None
+    }
 
 def compute_temporal_dynamic_range(stft_mag):
-    """Ratio of max frame power to quiet frame power (in dB)."""
+    """Ratio of maximum frame power to minimum frame power (dB)."""
     frame_power = np.sum(stft_mag ** 2, axis=0)
     max_p = np.max(frame_power)
     min_p = np.min(frame_power[frame_power > 0]) if np.any(frame_power > 0) else 1e-10
-    dr_db = 10 * np.log10((max_p + 1e-10) / (min_p + 1e-10))
-    return float(dr_db)
+    return float(10 * np.log10((max_p + 1e-10) / (min_p + 1e-10)))
 
 def compute_crest_factor(band_signal):
-    """Ratio of peak amplitude to RMS amplitude."""
+    """Ratio of peak absolute amplitude to RMS amplitude."""
     peak = np.max(np.abs(band_signal))
     rms = np.sqrt(np.mean(band_signal**2)) + 1e-10
     return float(peak / rms)
 
 def compute_harmonic_power_ratio(stft_mag, freqs, f0_min=80, f0_max=300):
-    """
-    Estimates fundamental frequency (f0) from average spectrum
-    and computes energy ratio of upper harmonics (2f0..K*f0) to f0.
-    """
+    """Energy ratio of upper harmonics relative to fundamental power."""
     avg_spectrum = np.mean(stft_mag, axis=1)
     f0_idx_search = np.where((freqs >= f0_min) & (freqs <= f0_max))[0]
     
@@ -43,12 +43,10 @@ def compute_harmonic_power_ratio(stft_mag, freqs, f0_min=80, f0_max=300):
     if f0 <= 0:
         return 0.0
     
-    # Power at Fundamental (f0)
     p_f0 = avg_spectrum[f0_bin] ** 2
-    
-    # Power at Harmonics (2*f0, 3*f0, ...)
     p_harmonics = 0.0
-    max_k = int(freqs[-1] // f0)
+    max_k = int(freqs[-1] // f0) if f0 > 0 else 0
+    
     for k in range(2, max_k + 1):
         target_f = k * f0
         k_bin = np.argmin(np.abs(freqs - target_f))
@@ -57,60 +55,107 @@ def compute_harmonic_power_ratio(stft_mag, freqs, f0_min=80, f0_max=300):
     return float(p_harmonics / (p_f0 + 1e-10))
 
 def compute_psnr(stft_mag):
-    """Ratio of max signal power to estimated noise floor (bottom 10th percentile)."""
+    """Signal-to-noise ratio above estimated noise floor (bottom 10th percentile)."""
     frame_power = np.sum(stft_mag ** 2, axis=0)
     p_max = np.max(frame_power)
     p_noise = np.percentile(frame_power, 10) + 1e-10
-    psnr_db = 10 * np.log10((p_max + 1e-10) / p_noise)
-    return float(psnr_db)
+    return float(10 * np.log10((p_max + 1e-10) / p_noise))
+
+def compute_peak_freq_wander(stft_mag, band_freqs):
+    """Standard deviation of the peak frequency trajectory across time frames (Hz)."""
+    if stft_mag.shape[0] == 0 or stft_mag.shape[1] == 0:
+        return 0.0
+    peak_bins = np.argmax(stft_mag, axis=0)
+    peak_freqs = band_freqs[peak_bins]
+    return float(np.std(peak_freqs))
 
 def process_audio_file(filepath):
-    """Loads a WAV file and computes sub-band acoustic metrics."""
+    """Processes audio and calculates metrics for each customized band."""
     signal, sr = librosa.load(filepath, sr=None)
     
-    # STFT Computation
     n_fft = 2048
     hop_length = 512
     stft = librosa.stft(signal, n_fft=n_fft, hop_length=hop_length)
     stft_mag, _ = librosa.magphase(stft)
     freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
     
-    row = {"Filename": os.path.basename(filepath)}
+    bands = get_bands(sr)
+    fname = os.path.basename(filepath)
+    label = "live" if fname.startswith("live_") else ("spoof" if fname.startswith("replayspoof_") else "mixed")
+    row = {"Filename": fname, "Label": label, "SampleRate": sr}
     
-    for band_name, (f_min, f_max) in BANDS.items():
-        # Mask bins belonging to current band
+    for band_name, band_range in bands.items():
+        if band_range is None:
+            continue
+            
+        f_min, f_max = band_range
         band_mask = (freqs >= f_min) & (freqs < min(f_max, sr / 2))
-        if not np.any(band_mask):
+        
+        if not np.any(band_mask) or f_min >= (sr / 2):
+            row[f"{band_name}_TDR"] = 0.0
+            row[f"{band_name}_CrestFactor"] = 0.0
+            row[f"{band_name}_HPR"] = 0.0
+            row[f"{band_name}_PSNR"] = 0.0
+            row[f"{band_name}_PeakWander"] = 0.0
             continue
             
         band_stft_mag = stft_mag[band_mask, :]
         band_freqs = freqs[band_mask]
         
-        # Bandpass time-domain reconstruction for Crest Factor
+        # Reconstruct bandpass signal for time-domain Crest Factor
         band_signal = librosa.istft(stft * band_mask[:, None], hop_length=hop_length)
         
-        # Calculate metrics
-        row[f"{band_name}_TDR_dB"] = compute_temporal_dynamic_range(band_stft_mag)
+        row[f"{band_name}_TDR"] = compute_temporal_dynamic_range(band_stft_mag)
         row[f"{band_name}_CrestFactor"] = compute_crest_factor(band_signal)
         row[f"{band_name}_HPR"] = compute_harmonic_power_ratio(band_stft_mag, band_freqs)
-        row[f"{band_name}_PSNR_dB"] = compute_psnr(band_stft_mag)
+        row[f"{band_name}_PSNR"] = compute_psnr(band_stft_mag)
+        row[f"{band_name}_PeakWander"] = compute_peak_freq_wander(band_stft_mag, band_freqs)
         
     return row
 
-def batch_analyze_directory(file_list):
+def compute_cohens_d(group_live, group_spoof):
+    """Calculates Cohen's d effect size between live and spoof groups."""
+    n1, n2 = len(group_live), len(group_spoof)
+    if n1 < 2 or n2 < 2:
+        return 0.0
+        
+    var1, var2 = np.var(group_live, ddof=1), np.var(group_spoof, ddof=1)
+    s_pooled = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
+    
+    if s_pooled == 0:
+        return 0.0
+        
+    return float((np.mean(group_live) - np.mean(group_spoof)) / s_pooled)
+
+def analyze_and_evaluate(file_list):
     results = []
     for filepath in file_list:
         if os.path.exists(filepath):
-            print(f"Processing: {filepath}")
             metrics = process_audio_file(filepath)
             results.append(metrics)
-        else:
-            print(f"File not found: {filepath}")
             
     df = pd.DataFrame(results)
-    return df
+    
+    live_df = df[df["Label"] == "live"]
+    spoof_df = df[df["Label"] == "spoof"]
+    
+    feature_cols = [c for c in df.columns if c not in ["Filename", "Label", "SampleRate"]]
+    cohen_results = []
+    
+    for col in feature_cols:
+        d_val = compute_cohens_d(live_df[col].values, spoof_df[col].values)
+        cohen_results.append({
+            "Feature Metric": col,
+            "Mean (Live)": np.mean(live_df[col]),
+            "Mean (Spoof)": np.mean(spoof_df[col]),
+            "Cohen's d": d_val,
+            "Separation Quality": "Strong" if abs(d_val) >= 0.8 else ("Moderate" if abs(d_val) >= 0.5 else "Weak")
+        })
+        
+    cohen_df = pd.DataFrame(cohen_results)
+    return df, cohen_df
 
-# List of files provided in your directory
+# Input files
 audio_files = [
     "live_andhika.wav", "live_whistle.wav", "live_bayinangis.wav", 
     "live_berawaldaritatap.wav", "mixed_sitianosora.wav", "live_halotest.wav", 
@@ -122,9 +167,14 @@ audio_files = [
 ]
 
 if __name__ == "__main__":
-    df = batch_analyze_directory(audio_files)
+    metrics_df, cohen_df = analyze_and_evaluate(audio_files)
     
-    # Save extracted metrics matrix
-    df.to_csv("spoof_detection_metrics.csv", index=False)
-    print("\nExtraction complete! Sample results:")
-    print(df.head())
+    # Save full feature dataset
+    metrics_df.to_csv("spoof_detection_custom_bands.csv", index=False)
+    
+    # Display top separated features sorted by absolute Cohen's d
+    cohen_df["Abs_d"] = cohen_df["Cohen's d"].abs()
+    ranked_cohen = cohen_df.sort_values(by="Abs_d", ascending=False).drop(columns=["Abs_d"])
+    
+    print("\n--- Top Features Ranked by Cohen's d Separation Quality ---")
+    print(ranked_cohen.head(12).to_string(index=False))
