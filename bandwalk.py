@@ -3,34 +3,40 @@ import numpy as np
 import pandas as pd
 import librosa
 
+# Define refined frequency bands and their unit definitions
 def get_bands(sr):
-    """Dynamically generates frequency bands based on input sample rate."""
     nyquist = sr / 2.0
     return {
-        "Infrasound": (0, 20),
-        "SubBass": (20, 50),
-        "PowerLine": (50, 120),
-        "CoreVocal": (120, 1000),
-        "Telephony_DTMF": (1000, 3500),
-        "AudiophileHigh": (3500, min(20000, nyquist)),
-        "Ultrasonic_Nyquist": (20000, nyquist) if nyquist > 20000 else None
+        "Infrasound_0_20Hz": (0, 20),
+        "SubBass_20_50Hz": (20, 50),
+        "PowerLine_50_120Hz": (50, 120),
+        "CoreVocal_120_1000Hz": (120, 1000),
+        "Telephony_1000_3500Hz": (1000, 3500),
+        "Audiophile_3500_20000Hz": (3500, min(20000, nyquist)),
+        "Ultrasonic_20000HzPlus": (20000, nyquist) if nyquist > 20000 else None
     }
 
+UNITS = {
+    "TDR": "dB",
+    "CrestFactor": "Ratio",
+    "HPR": "Ratio",
+    "PSNR": "dB",
+    "PeakWander": "Hz"
+}
+
+# Metric calculation functions
 def compute_temporal_dynamic_range(stft_mag):
-    """Ratio of maximum frame power to minimum frame power (dB)."""
     frame_power = np.sum(stft_mag ** 2, axis=0)
     max_p = np.max(frame_power)
     min_p = np.min(frame_power[frame_power > 0]) if np.any(frame_power > 0) else 1e-10
     return float(10 * np.log10((max_p + 1e-10) / (min_p + 1e-10)))
 
 def compute_crest_factor(band_signal):
-    """Ratio of peak absolute amplitude to RMS amplitude."""
     peak = np.max(np.abs(band_signal))
     rms = np.sqrt(np.mean(band_signal**2)) + 1e-10
     return float(peak / rms)
 
 def compute_harmonic_power_ratio(stft_mag, freqs, f0_min=80, f0_max=300):
-    """Energy ratio of upper harmonics relative to fundamental power."""
     avg_spectrum = np.mean(stft_mag, axis=1)
     f0_idx_search = np.where((freqs >= f0_min) & (freqs <= f0_max))[0]
     
@@ -55,14 +61,12 @@ def compute_harmonic_power_ratio(stft_mag, freqs, f0_min=80, f0_max=300):
     return float(p_harmonics / (p_f0 + 1e-10))
 
 def compute_psnr(stft_mag):
-    """Signal-to-noise ratio above estimated noise floor (bottom 10th percentile)."""
     frame_power = np.sum(stft_mag ** 2, axis=0)
     p_max = np.max(frame_power)
     p_noise = np.percentile(frame_power, 10) + 1e-10
     return float(10 * np.log10((p_max + 1e-10) / p_noise))
 
 def compute_peak_freq_wander(stft_mag, band_freqs):
-    """Standard deviation of the peak frequency trajectory across time frames (Hz)."""
     if stft_mag.shape[0] == 0 or stft_mag.shape[1] == 0:
         return 0.0
     peak_bins = np.argmax(stft_mag, axis=0)
@@ -70,9 +74,7 @@ def compute_peak_freq_wander(stft_mag, band_freqs):
     return float(np.std(peak_freqs))
 
 def process_audio_file(filepath):
-    """Processes audio and calculates metrics for each customized band."""
     signal, sr = librosa.load(filepath, sr=None)
-    
     n_fft = 2048
     hop_length = 512
     stft = librosa.stft(signal, n_fft=n_fft, hop_length=hop_length)
@@ -81,8 +83,16 @@ def process_audio_file(filepath):
     
     bands = get_bands(sr)
     fname = os.path.basename(filepath)
-    label = "live" if fname.startswith("live_") else ("spoof" if fname.startswith("replayspoof_") else "mixed")
-    row = {"Filename": fname, "Label": label, "SampleRate": sr}
+    
+    # Classify group based on filename prefix
+    if fname.startswith("live_"):
+        label = "live"
+    elif fname.startswith("replayspoof_"):
+        label = "replayspoof"
+    else:
+        label = "mixed"
+        
+    row = {"Filename": fname, "Group": label, "SampleRate": sr}
     
     for band_name, band_range in bands.items():
         if band_range is None:
@@ -101,8 +111,6 @@ def process_audio_file(filepath):
             
         band_stft_mag = stft_mag[band_mask, :]
         band_freqs = freqs[band_mask]
-        
-        # Reconstruct bandpass signal for time-domain Crest Factor
         band_signal = librosa.istft(stft * band_mask[:, None], hop_length=hop_length)
         
         row[f"{band_name}_TDR"] = compute_temporal_dynamic_range(band_stft_mag)
@@ -114,48 +122,58 @@ def process_audio_file(filepath):
     return row
 
 def compute_cohens_d(group_live, group_spoof):
-    """Calculates Cohen's d effect size between live and spoof groups."""
     n1, n2 = len(group_live), len(group_spoof)
     if n1 < 2 or n2 < 2:
         return 0.0
-        
     var1, var2 = np.var(group_live, ddof=1), np.var(group_spoof, ddof=1)
     s_pooled = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
-    
-    if s_pooled == 0:
-        return 0.0
-        
-    return float((np.mean(group_live) - np.mean(group_spoof)) / s_pooled)
+    return float((np.mean(group_live) - np.mean(group_spoof)) / s_pooled) if s_pooled > 0 else 0.0
 
-def analyze_and_evaluate(file_list):
+def generate_comparison_summary(file_list):
     results = []
     for filepath in file_list:
         if os.path.exists(filepath):
-            metrics = process_audio_file(filepath)
-            results.append(metrics)
+            results.append(process_audio_file(filepath))
             
     df = pd.DataFrame(results)
     
-    live_df = df[df["Label"] == "live"]
-    spoof_df = df[df["Label"] == "spoof"]
+    live_df = df[df["Group"] == "live"]
+    spoof_df = df[df["Group"] == "replayspoof"]
     
-    feature_cols = [c for c in df.columns if c not in ["Filename", "Label", "SampleRate"]]
-    cohen_results = []
+    feature_cols = [c for c in df.columns if c not in ["Filename", "Group", "SampleRate"]]
     
+    summary_data = []
     for col in feature_cols:
-        d_val = compute_cohens_d(live_df[col].values, spoof_df[col].values)
-        cohen_results.append({
+        # Determine metric type and unit
+        metric_type = col.split("_")[-1]
+        unit = UNITS.get(metric_type, "N/A")
+        
+        live_vals = live_df[col].values
+        spoof_vals = spoof_df[col].values
+        
+        live_mean = np.mean(live_vals)
+        live_std = np.std(live_vals, ddof=1)
+        
+        spoof_mean = np.mean(spoof_vals)
+        spoof_std = np.std(spoof_vals, ddof=1)
+        
+        d_val = compute_cohens_d(live_vals, spoof_vals)
+        
+        summary_data.append({
             "Feature Metric": col,
-            "Mean (Live)": np.mean(live_df[col]),
-            "Mean (Spoof)": np.mean(spoof_df[col]),
-            "Cohen's d": d_val,
-            "Separation Quality": "Strong" if abs(d_val) >= 0.8 else ("Moderate" if abs(d_val) >= 0.5 else "Weak")
+            "Unit": unit,
+            "Live Avg": round(live_mean, 3),
+            "Live StdDev": round(live_std, 3),
+            "ReplaySpoof Avg": round(spoof_mean, 3),
+            "ReplaySpoof StdDev": round(spoof_std, 3),
+            "Cohen's d": round(d_val, 3),
+            "Separation Strength": "Strong" if abs(d_val) >= 0.8 else ("Moderate" if abs(d_val) >= 0.5 else "Weak")
         })
         
-    cohen_df = pd.DataFrame(cohen_results)
-    return df, cohen_df
+    summary_df = pd.DataFrame(summary_data)
+    return df, summary_df
 
-# Input files
+# Dataset audio files list
 audio_files = [
     "live_andhika.wav", "live_whistle.wav", "live_bayinangis.wav", 
     "live_berawaldaritatap.wav", "mixed_sitianosora.wav", "live_halotest.wav", 
@@ -167,14 +185,17 @@ audio_files = [
 ]
 
 if __name__ == "__main__":
-    metrics_df, cohen_df = analyze_and_evaluate(audio_files)
+    raw_df, summary_df = generate_comparison_summary(audio_files)
     
-    # Save full feature dataset
-    metrics_df.to_csv("spoof_detection_custom_bands.csv", index=False)
+    # Save files
+    raw_df.to_csv("audio_features_raw.csv", index=False)
+    summary_df.to_csv("feature_comparison_summary.csv", index=False)
     
-    # Display top separated features sorted by absolute Cohen's d
-    cohen_df["Abs_d"] = cohen_df["Cohen's d"].abs()
-    ranked_cohen = cohen_df.sort_values(by="Abs_d", ascending=False).drop(columns=["Abs_d"])
+    # Rank features by absolute Cohen's d separation power
+    summary_df["Abs_d"] = summary_df["Cohen's d"].abs()
+    ranked_summary = summary_df.sort_values(by="Abs_d", ascending=False).drop(columns=["Abs_d"])
     
-    print("\n--- Top Features Ranked by Cohen's d Separation Quality ---")
-    print(ranked_cohen.head(12).to_string(index=False))
+    print("\n====================================================================================")
+    print("              FEATURE COMPARISON SUMMARY ACROSS GROUPS (LIVE vs REPLAYSPOOF)")
+    print("====================================================================================\n")
+    print(ranked_summary.to_string(index=False))
